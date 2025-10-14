@@ -1,0 +1,192 @@
+import pandas as pd
+from sqlalchemy import create_engine, text
+from datetime import datetime
+
+# ==========================================
+# CONFIGURACIÓN DE CONEXIONES
+# ==========================================
+
+# --- PostgreSQL: Base de Recursos Humanos ---
+PG_USER = "postgres"
+PG_PASS = "1010760345"
+PG_HOST = "localhost"
+PG_PORT = 5432
+PG_DB   = "recursos_humanos"
+
+pg_url = f"postgresql+psycopg2://{PG_USER}:{PG_PASS}@{PG_HOST}:{PG_PORT}/{PG_DB}"
+
+# ✅ Forzamos la conexión a usar LATIN1 para evitar errores de decodificación
+pg_eng = create_engine(
+    pg_url,
+    connect_args={
+        "options": "-c client_encoding=LATIN1"
+    }
+)
+
+# --- MySQL: Base de Ventas ---
+MYSQL_USER = "ventas_user"
+MYSQL_PWD  = "1010760345"
+MYSQL_HOST = "127.0.0.1"
+MYSQL_PORT = 3306
+MYSQL_DB   = "ventas"
+
+# ✅ Especificamos charset latin1 para evitar conflictos de codificación
+mysql_url = f"mysql+pymysql://{MYSQL_USER}:{MYSQL_PWD}@{MYSQL_HOST}:{MYSQL_PORT}/{MYSQL_DB}?charset=latin1"
+mysql_eng = create_engine(mysql_url, pool_pre_ping=True)
+
+# --- MySQL: Data Warehouse (Destino) ---
+DWH_USER = "root"
+DWH_PASS = ""
+DWH_HOST = "127.0.0.1"
+DWH_PORT = 3306
+DWH_DB   = "dwh"
+
+dwh_url = f"mysql+pymysql://{DWH_USER}:{DWH_PASS}@{DWH_HOST}:{DWH_PORT}/{DWH_DB}?charset=latin1"
+dwh_eng = create_engine(dwh_url, pool_pre_ping=True)
+
+# ==========================================
+# EXTRACCIÓN DE DATOS
+# ==========================================
+
+#--- SQL Recursos Humanos (PostgreSQL) ---
+sql_rh = """
+SELECT
+    e.employee_id           AS id_vendedor,
+    e.first_name            AS nombre_vendedor,
+    e.last_name             AS apellido_vendedor,
+    j.job_title             AS cargo,
+    d.department_name       AS departamento,
+    l.city                  AS ciudad,
+    l.state_province        AS estado,
+    c.country_name          AS pais,
+    r.region_name           AS region
+FROM employees e
+JOIN jobs j        ON e.job_id = j.job_id
+LEFT JOIN departments d ON e.department_id = d.department_id
+LEFT JOIN locations l   ON d.location_id = l.location_id
+LEFT JOIN countries c   ON l.country_id  = c.country_id
+LEFT JOIN regions r     ON c.region_id   = r.region_id;
+"""
+
+try:
+    with pg_eng.connect() as conn:
+        df_rh = pd.read_sql(sql_rh, conn)
+
+    # ✅ Forzamos la decodificación de todas las columnas tipo texto a LATIN1
+    for col in df_rh.select_dtypes(include=["object"]).columns:
+        df_rh[col] = (
+            df_rh[col]
+            .astype(str)
+            .apply(lambda x: x.encode("latin1", errors="ignore").decode("latin1", errors="ignore"))
+        )
+
+    print("✅ Datos RH cargados correctamente:", df_rh.shape)
+
+except Exception as e:
+    print("❌ Error al cargar datos de Recursos Humanos:", e)
+    raise
+
+# --- SQL Ventas (MySQL) ---
+sql_ventas = """
+SELECT
+    v.id_venta,
+    d.id_detalle,
+    v.id_vendedor,
+    d.id_producto,
+    p.nombre_producto,
+    p.categoria,
+    v.fecha_venta,
+    d.cantidad,
+    d.precio_unitario,
+    (d.cantidad * d.precio_unitario) AS total_bruto
+FROM ventas v
+JOIN detalle_venta d ON v.id_venta = d.id_venta
+JOIN productos p ON d.id_producto = p.id_producto;
+"""
+
+try:
+    df_ventas = pd.read_sql(sql_ventas, mysql_eng)
+    print("✅ Datos Ventas cargados:", df_ventas.shape)
+except Exception as e:
+    print("❌ Error al cargar datos de Ventas:", e)
+    raise
+
+# ==========================================
+# TRANSFORMACIÓN
+# ==========================================
+
+df_union = df_ventas.merge(df_rh, on="id_vendedor", how="left", validate="m:1")
+df_union["fecha_venta"] = pd.to_datetime(df_union["fecha_venta"]).dt.date
+
+# --- Dim Producto ---
+dim_producto = (
+    df_union[["id_producto", "nombre_producto", "categoria"]]
+    .drop_duplicates()
+    .reset_index(drop=True)
+)
+dim_producto.insert(0, "sk_producto", range(1, len(dim_producto) + 1))
+
+# --- Dim Ubicación ---
+dim_ubicacion = (
+    df_union[["ciudad", "estado", "pais", "region"]]
+    .drop_duplicates()
+    .reset_index(drop=True)
+)
+dim_ubicacion.insert(0, "sk_ubicacion", range(1, len(dim_ubicacion) + 1))
+
+# --- Dim Vendedor ---
+dim_vendedor = (
+    df_union[["id_vendedor", "nombre_vendedor", "apellido_vendedor", "cargo", "departamento"]]
+    .drop_duplicates(subset=["id_vendedor"])
+    .reset_index(drop=True)
+)
+dim_vendedor.insert(0, "sk_vendedor", range(1, len(dim_vendedor) + 1))
+
+# --- Dim Tiempo ---
+dim_tiempo = (
+    pd.DataFrame({"fecha": sorted(df_union["fecha_venta"].dropna().unique())})
+    .assign(
+        anio=lambda d: d["fecha"].apply(lambda x: x.year),
+        mes=lambda d: d["fecha"].apply(lambda x: x.month),
+        dia=lambda d: d["fecha"].apply(lambda x: x.day),
+        trimestre=lambda d: d["fecha"].apply(lambda x: (x.month - 1)//3 + 1)
+    )
+)
+dim_tiempo.insert(0, "sk_fecha", range(1, len(dim_tiempo) + 1))
+
+# ==========================================
+# TABLA DE HECHOS
+# ==========================================
+
+f = df_union.merge(dim_producto[["sk_producto", "id_producto"]], on="id_producto", how="left")
+f = f.merge(dim_vendedor[["sk_vendedor", "id_vendedor"]], on="id_vendedor", how="left")
+f = f.merge(dim_ubicacion, on=["ciudad", "estado", "pais", "region"], how="left")
+f = f.merge(
+    dim_tiempo.rename(columns={"fecha": "fecha_venta"})[["sk_fecha", "fecha_venta"]],
+    on="fecha_venta", how="left"
+)
+
+f["ingreso_neto"] = f["total_bruto"]
+
+fact_ventas = f[[
+    "id_venta", "id_detalle",
+    "sk_producto", "sk_vendedor", "sk_ubicacion", "sk_fecha",
+    "cantidad", "precio_unitario", "total_bruto", "ingreso_neto"
+]].copy()
+
+# ==========================================
+# CARGA AL DWH (MySQL)
+# ==========================================
+
+try:
+    dim_producto.to_sql("dim_producto", dwh_eng, if_exists="replace", index=False)
+    dim_ubicacion.to_sql("dim_ubicacion", dwh_eng, if_exists="replace", index=False)
+    dim_vendedor.to_sql("dim_vendedor", dwh_eng, if_exists="replace", index=False)
+    dim_tiempo.to_sql("dim_tiempo", dwh_eng, if_exists="replace", index=False)
+    fact_ventas.to_sql("fact_ventas", dwh_eng, if_exists="replace", index=False)
+
+    print("✅ ETL completado con éxito.")
+    print("Tablas creadas en el DWH:", dwh_url)
+    print("🕒 Fecha y hora:", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+except Exception as e:
+    print("❌ Error al cargar datos al Data Warehouse:", e)
